@@ -29,7 +29,10 @@ from gnuradio.filter import firdes
 from gnuradio.filter import pfb
 from math import pi
 from optparse import OptionParser
+from contextlib import contextmanager
 
+import fcntl
+import gc
 import grgsm
 import numpy
 import os
@@ -37,6 +40,9 @@ import osmosdr
 import pmt
 import time
 import sys
+import weakref
+
+USB_CLAIM_LOCK_WAIT_S = 15.0
 
 # from wideband_receiver import *
 
@@ -302,7 +308,60 @@ class channel_info(object):
         return "ARFCN: %4u, Freq: %6.1fM, CID: %5u, LAC: %5u, MCC: %3u, MNC: %3u, Pwr: %3i" % (
             self.arfcn, self.freq / 1e6, self.cid, self.lac, self.mcc, self.mnc, self.power)
 
-def do_scan(samp_rate, band, speed, ppm, gain, args, prn = None, debug = False):
+@contextmanager
+def usb_claim_lock(path, unmute=None):
+    if not path:
+        yield
+        return
+    try:
+        fh = open(path, "a+")
+    except OSError as exc:
+        if unmute:
+            unmute()
+        sys.stderr.write("USB claim lock: cannot open %s: %s\n" % (path, exc))
+        raise SystemExit(1)
+    deadline = time.monotonic() + USB_CLAIM_LOCK_WAIT_S
+    try:
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    if unmute:
+                        unmute()
+                    sys.stderr.write("USB claim lock timeout: %s\n" % path)
+                    raise SystemExit(1)
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        fh.close()
+
+
+def release_osmosdr_source(scanner):
+    src = getattr(scanner, "rtlsdr_source", None)
+    if src is None:
+        return
+    wr = weakref.ref(src)
+    try:
+        scanner.disconnect(src, scanner.head)
+    except Exception:
+        try:
+            scanner.disconnect((src, 0), (scanner.head, 0))
+        except Exception:
+            pass
+    scanner.rtlsdr_source = None
+    del src
+    gc.collect()
+    if wr() is not None:
+        raise RuntimeError("osmosdr source still reachable after USB claim release")
+
+
+def do_scan(samp_rate, band, speed, ppm, gain, args, prn = None, debug = False, usb_claim_lock_path=""):
     signallist = []
     channels_num = int(samp_rate / 0.2e6)
     for arfcn_range in grgsm.arfcn.get_arfcn_ranges(band):
@@ -316,6 +375,7 @@ def do_scan(samp_rate, band, speed, ppm, gain, args, prn = None, debug = False):
 
         while current_freq < stop_freq:
 
+            save = None
             if not debug:
                 # silence rtl_sdr output:
                 # open 2 fds
@@ -326,11 +386,18 @@ def do_scan(samp_rate, band, speed, ppm, gain, args, prn = None, debug = False):
                 os.dup2(null_fds[0], 1)
                 os.dup2(null_fds[1], 2)
 
+            def unmute():
+                if save is None:
+                    return
+                os.dup2(save[0], 1)
+                os.dup2(save[1], 2)
+
             # instantiate scanner and processor
-            scanner = wideband_scanner(rec_len=6 - speed,
-                                       sample_rate=samp_rate,
-                                       carrier_frequency=current_freq,
-                                       ppm=ppm, gain=gain, args=args)
+            with usb_claim_lock(usb_claim_lock_path, unmute=unmute):
+                scanner = wideband_scanner(rec_len=6 - speed,
+                                           sample_rate=samp_rate,
+                                           carrier_frequency=current_freq,
+                                           ppm=ppm, gain=gain, args=args)
 
             # start recording
             scanner.start()
@@ -363,7 +430,13 @@ def do_scan(samp_rate, band, speed, ppm, gain, args, prn = None, debug = False):
                                         neighbour_list, cell_arfcn_list)
                     found_list.append(info)
 
-            scanner = None
+            if usb_claim_lock_path:
+                with usb_claim_lock(usb_claim_lock_path, unmute=unmute):
+                    release_osmosdr_source(scanner)
+                    scanner = None
+                    gc.collect()
+            else:
+                scanner = None
 
 
             if not debug:
@@ -402,6 +475,8 @@ def argument_parser():
                       help="If set, verbose information output is printed: ccch configuration, cell ARFCN's, neighbour ARFCN's")
     parser.add_option("-d", "--debug", action="store_true",
                       help="Print additional debug messages")
+    parser.add_option("", "--usb-claim-lock", dest="usb_claim_lock", type="string", default="",
+                      help="Host-wide USB claim lock file. Empty: no lock.")
 
     """
         Dont forget: sudo sysctl kernel.shmmni=32000
@@ -432,7 +507,8 @@ def main(options = None):
                 print(info.get_verbose_info())
     print("")
     do_scan(options.samp_rate, options.band, options.speed,
-            options.ppm, options.gain, options.args, prn = printfunc, debug = options.debug)
+            options.ppm, options.gain, options.args, prn = printfunc, debug = options.debug,
+            usb_claim_lock_path=options.usb_claim_lock or "")
 
 if __name__ == '__main__':
     main()
